@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/init/env python3
 import time
 import argparse
 import threading
@@ -13,17 +13,19 @@ warnings.filterwarnings('ignore', category=RuntimeWarning)
 # ARGUMENTOS E FUNÇÕES AUXILIARES
 # ==========================================================
 def parse_args():
-    parser = argparse.ArgumentParser(description="SparseLU Paralelo com Threads (Python)")
-    parser.add_argument("--matrix-size", type=int, default=10, help="Tamanho da matriz de blocos (NB)")
-    parser.add_argument("--submatrix-size", type=int, default=64, help="Tamanho de cada bloco (BSIZE)")
-    parser.add_argument("--nth", type=int, default=4, help="Número de threads")
-    parser.add_argument("--niter", type=int, default=3, help="Número de iterações de teste")
+    parser = argparse.ArgumentParser(description="SparseLU Paralelo com Threads e Verificação (Python)")
+    parser.add_argument("matrix_size", nargs="?", type=int, default=10, help="Tamanho da matriz de blocos (NB)")
+    parser.add_argument("submatrix_size", nargs="?", type=int, default=64, help="Tamanho de cada bloco (BSIZE)")
+    parser.add_argument("nth", nargs="?", type=int, default=4, help="Número de threads")
     return parser.parse_args()
 
-def print_summary(params, times):
+def print_summary(params, times, verified=None):
     avg_time = sum(times) / len(times)
     print(f"\n--- Resumo SparseLU (PARALELO - {params.nth} Threads) ---")
     print(f"Matriz: {params.matrix_size}x{params.matrix_size} blocos | Bloco: {params.submatrix_size}x{params.submatrix_size}")
+    if verified is not None:
+        status = "SUCESSO (Correto)" if verified else "FALHA (Incorreto)"
+        print(f"Verificação de Corretude: {status}")
     print(f"Tempos iterativos: {[f'{t:.4f}s' for t in times]}")
     print(f"Tempo médio: {avg_time:.4f} segundos")
 
@@ -96,6 +98,34 @@ def bmod(col, row, ik, BSIZE):
                 ik[i, j] -= col[i, k] * row[k, j]
 
 # ==========================================================
+# EXECUÇÃO SEQUENCIAL (Para fins de verificação de corretude)
+# ==========================================================
+def sparselu_sequential(BENCH, matrix_size, submatrix_size):
+    for kk in range(matrix_size):
+        diag_key = (kk, kk)
+        if diag_key in BENCH and BENCH[diag_key] is not None:
+            lu0(BENCH[diag_key], submatrix_size)
+
+        for jj in range(kk + 1, matrix_size):
+            key = (kk, jj)
+            if key in BENCH and BENCH[key] is not None:
+                fwd(BENCH[(kk, kk)], BENCH[key], submatrix_size)
+
+        for ii in range(kk + 1, matrix_size):
+            key = (ii, kk)
+            if key in BENCH and BENCH[key] is not None:
+                bdiv(BENCH[(kk, kk)], BENCH[key], submatrix_size)
+
+        for ii in range(kk + 1, matrix_size):
+            if (ii, kk) in BENCH and BENCH[(ii, kk)] is not None:
+                for jj in range(kk + 1, matrix_size):
+                    if (kk, jj) in BENCH and BENCH[(kk, jj)] is not None:
+                        target_key = (ii, jj)
+                        if target_key not in BENCH or BENCH[target_key] is None:
+                            BENCH[target_key] = allocate_clean_block(submatrix_size)
+                        bmod(BENCH[(ii, kk)], BENCH[(kk, jj)], BENCH[target_key], submatrix_size)
+
+# ==========================================================
 # LÓGICA DE EXECUÇÃO PARALELA (TASK DEPENDENCY)
 # ==========================================================
 def sparselu_task_dep_call(BENCH, matrix_size, submatrix_size, num_threads):
@@ -145,6 +175,32 @@ def sparselu_task_dep_call(BENCH, matrix_size, submatrix_size, num_threads):
 
             for f in futures: f.result()
 
+def verify_results(matrix_size, submatrix_size, parallel_bench):
+    """Compara o resultado e exibe a diferença máxima caso ultrapasse a tolerância."""
+    seq_bench = genmat(matrix_size, submatrix_size)
+    sparselu_sequential(seq_bench, matrix_size, submatrix_size)
+
+    max_diff = 0.0
+    all_keys = set(parallel_bench.keys()).union(set(seq_bench.keys()))
+    for key in all_keys:
+        block_par = parallel_bench.get(key)
+        block_seq = seq_bench.get(key)
+
+        if block_par is None and block_seq is None:
+            continue
+        if block_par is None or block_seq is None:
+            return False
+        
+        diff = np.max(np.abs(block_par - block_seq))
+        if diff > max_diff:
+            max_diff = diff
+
+    # Se a diferença máxima for menor que 1e-4, consideramos sucesso em ambiente paralelo
+    is_ok = max_diff < 1e-4
+    if not is_ok:
+        print(f"\n[AVISO] Verificação falhou. Maior desvio encontrado: {max_diff}")
+    return is_ok
+
 def main():
     params = parse_args()
     
@@ -153,11 +209,14 @@ def main():
         t0 = time.perf_counter_ns()
         sparselu_task_dep_call(BENCH, params.matrix_size, params.submatrix_size, params.nth)
         t1 = time.perf_counter_ns()
-        return (t1 - t0) / 1e9
+        return (t1 - t0) / 1e9, BENCH
 
-    run() # Warmup
-    times = [run() for _ in range(params.niter)]
-    print_summary(params, times)
+    t_elapsed, bench_check = run()
+    is_correct = verify_results(params.matrix_size, params.submatrix_size, bench_check)
+
+    times = [t_elapsed]
+
+    print_summary(params, times, verified=is_correct)
 
 if __name__ == "__main__":
     main()

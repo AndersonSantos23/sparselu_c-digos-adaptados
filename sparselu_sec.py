@@ -11,16 +11,18 @@ warnings.filterwarnings('ignore', category=RuntimeWarning)
 # ARGUMENTOS E FUNÇÕES AUXILIARES
 # ==========================================================
 def parse_args():
-    parser = argparse.ArgumentParser(description="SparseLU Sequencial (Python)")
-    parser.add_argument("--matrix-size", type=int, default=10, help="Tamanho da matriz de blocos (NB)")
-    parser.add_argument("--submatrix-size", type=int, default=64, help="Tamanho de cada bloco (BSIZE)")
-    parser.add_argument("--niter", type=int, default=3, help="Número de iterações de teste")
+    parser = argparse.ArgumentParser(description="SparseLU Sequencial com Verificação (Python)")
+    parser.add_argument("matrix_size", nargs="?", type=int, default=10, help="Tamanho da matriz de blocos (NB)")
+    parser.add_argument("submatrix_size", nargs="?", type=int, default=64, help="Tamanho de cada bloco (BSIZE)")
     return parser.parse_args()
 
-def print_summary(params, times):
+def print_summary(params, times, verified=None):
     avg_time = sum(times) / len(times)
     print(f"\n--- Resumo SparseLU (SEQUENCIAL) ---")
     print(f"Matriz: {params.matrix_size}x{params.matrix_size} blocos | Bloco: {params.submatrix_size}x{params.submatrix_size}")
+    if verified is not None:
+        status = "SUCESSO (Correto)" if verified else "FALHA (Incorreto)"
+        print(f"Verificação de Corretude: {status}")
     print(f"Tempos iterativos: {[f'{t:.4f}s' for t in times]}")
     print(f"Tempo médio: {avg_time:.4f} segundos")
 
@@ -120,19 +122,45 @@ def sparselu_seq_call(BENCH, matrix_size, submatrix_size):
                             BENCH[target_key] = allocate_clean_block(submatrix_size)
                         bmod(BENCH[ii, kk], BENCH[kk, jj], BENCH[target_key], submatrix_size)
 
+def verify_results(matrix_size, submatrix_size, result_bench):
+    """Compara o resultado e exibe a diferença máxima caso ultrapasse a tolerância."""
+    ref_bench = genmat(matrix_size, submatrix_size)
+    sparselu_seq_call(ref_bench, matrix_size, submatrix_size)
+
+    max_diff = 0.0
+    all_keys = set(result_bench.keys()).union(set(ref_bench.keys()))
+    for key in all_keys:
+        block_res = result_bench.get(key)
+        block_ref = ref_bench.get(key)
+
+        if block_res is None and block_ref is None:
+            continue
+        if block_res is None or block_ref is None:
+            return False
+        
+        diff = np.max(np.abs(block_res - block_ref))
+        if diff > max_diff:
+            max_diff = diff
+
+    is_ok = max_diff < 1e-4
+    if not is_ok:
+        print(f"\n[AVISO] Verificação sequencial falhou. Maior desvio encontrado: {max_diff}")
+    return is_ok
+
 def main():
     params = parse_args()
     
-    def run():
-        BENCH = genmat(params.matrix_size, params.submatrix_size)
-        t0 = time.perf_counter_ns()
-        sparselu_seq_call(BENCH, params.matrix_size, params.submatrix_size)
-        t1 = time.perf_counter_ns()
-        return (t1 - t0) / 1e9
+    warmup_bench = genmat(params.matrix_size, params.submatrix_size)
+    sparselu_seq_call(warmup_bench, params.matrix_size, params.submatrix_size)
+    is_correct = verify_results(params.matrix_size, params.submatrix_size, warmup_bench)
 
-    run() # Warmup
-    times = [run() for _ in range(params.niter)]
-    print_summary(params, times)
+    BENCH = genmat(params.matrix_size, params.submatrix_size)
+    t0 = time.perf_counter_ns()
+    sparselu_seq_call(BENCH, params.matrix_size, params.submatrix_size)
+    t1 = time.perf_counter_ns()
+    times = [(t1 - t0) / 1e9]
+
+    print_summary(params, times, verified=is_correct)
 
 if __name__ == "__main__":
     main()
