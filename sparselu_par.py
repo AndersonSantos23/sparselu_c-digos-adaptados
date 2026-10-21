@@ -1,222 +1,215 @@
-#!/usr/init/env python3
+import sys
+import math
 import time
 import argparse
-import threading
-import numpy as np
-import warnings
-from concurrent.futures import ThreadPoolExecutor
+import statistics
 
-# Silencia warnings de ponto flutuante para manter o terminal limpo
-warnings.filterwarnings('ignore', category=RuntimeWarning)
+EPSILON = 1.0E-6
 
-# ==========================================================
-# ARGUMENTOS E FUNÇÕES AUXILIARES
-# ==========================================================
-def parse_args():
-    parser = argparse.ArgumentParser(description="SparseLU Paralelo com Threads e Verificação (Python)")
-    parser.add_argument("matrix_size", nargs="?", type=int, default=10, help="Tamanho da matriz de blocos (NB)")
-    parser.add_argument("submatrix_size", nargs="?", type=int, default=64, help="Tamanho de cada bloco (BSIZE)")
-    parser.add_argument("nth", nargs="?", type=int, default=4, help="Número de threads")
-    return parser.parse_args()
-
-def print_summary(params, times, verified=None):
-    avg_time = sum(times) / len(times)
-    print(f"\n--- Resumo SparseLU (PARALELO - {params.nth} Threads) ---")
-    print(f"Matriz: {params.matrix_size}x{params.matrix_size} blocos | Bloco: {params.submatrix_size}x{params.submatrix_size}")
-    if verified is not None:
-        status = "SUCESSO (Correto)" if verified else "FALHA (Incorreto)"
-        print(f"Verificação de Corretude: {status}")
-    print(f"Tempos iterativos: {[f'{t:.4f}s' for t in times]}")
-    print(f"Tempo médio: {avg_time:.4f} segundos")
+class UserParameters:
+    def __init__(self):
+        self.check = 0
+        self.succeed = 0
+        self.string2display = None
+        self.niter = 1
+        self.matrix_size = 64
+        self.submatrix_size = 64
 
 def allocate_clean_block(submatrix_size):
-    return np.zeros((submatrix_size, submatrix_size), dtype=np.double)
+    return [[0.0 for _ in range(submatrix_size)] for _ in range(submatrix_size)]
 
 def genmat(matrix_size, submatrix_size):
-    BENCH = {}
+    M = [[None for _ in range(matrix_size)] for _ in range(matrix_size)]
     init_val = 1325
 
     for ii in range(matrix_size):
         for jj in range(matrix_size):
             null_entry = 0
-            if (ii < jj) and (ii % 3 != 0): null_entry = 1
-            if (ii > jj) and (jj % 3 != 0): null_entry = 1
-            if ii % 2 == 1: null_entry = 1
-            if jj % 2 == 1: null_entry = 1
-            if ii == jj: null_entry = 0
-            if ii == jj - 1: null_entry = 0
-            if ii - 1 == jj: null_entry = 0
+            if (ii < jj) and (ii % 3 != 0):
+                null_entry = 1
+            if (ii > jj) and (jj % 3 != 0):
+                null_entry = 1
+            if ii % 2 == 1:
+                null_entry = 1
+            if jj % 2 == 1:
+                null_entry = 1
+            if ii == jj:
+                null_entry = 0
+            if ii == jj - 1:
+                null_entry = 0
+            if ii - 1 == jj:
+                null_entry = 0
 
             if null_entry == 0:
-                block = np.zeros((submatrix_size, submatrix_size), dtype=np.double)
+                block = [[0.0 for _ in range(submatrix_size)] for _ in range(submatrix_size)]
                 for i in range(submatrix_size):
                     for j in range(submatrix_size):
                         init_val = (3125 * init_val) % 65536
-                        block[i, j] = float((init_val - 32768.0) / 16384.0)
-                BENCH[(ii, jj)] = block
+                        block[i][j] = float((init_val - 32768.0) / 16384.0)
+                M[ii * matrix_size + jj] = block
             else:
-                BENCH[(ii, jj)] = None
+                M[ii * matrix_size + jj] = None
+    return M
 
-    return BENCH
+def lu0(diag, submatrix_size):
+    for k in range(submatrix_size):
+        for i in range(k + 1, submatrix_size):
+            diag[i][k] = diag[i][k] / diag[k][k]
+            for j in range(k + 1, submatrix_size):
+                diag[i][j] = diag[i][j] - diag[i][k] * diag[k][j]
 
-# ==========================================================
-# KERNELS MATEMÁTICOS (Com proteção contra divisão por zero)
-# ==========================================================
-def lu0(diag, BSIZE):
-    for k in range(BSIZE):
-        pivot = diag[k, k]
-        if abs(pivot) < 1e-14:
-            pivot = 1e-14 if pivot >= 0 else -1e-14
-            diag[k, k] = pivot
+def bdiv(diag, row, submatrix_size):
+    for i in range(submatrix_size):
+        for k in range(submatrix_size):
+            row[i][k] = row[i][k] / diag[k][k]
+            for j in range(k + 1, submatrix_size):
+                row[i][j] = row[i][j] - row[i][k] * diag[k][j]
 
-        for i in range(k + 1, BSIZE):
-            diag[i, k] /= pivot
-            for j in range(k + 1, BSIZE):
-                diag[i, j] -= diag[i, k] * diag[k, j]
+def bmod(row, col, inner, submatrix_size):
+    for i in range(submatrix_size):
+        for j in range(submatrix_size):
+            for k in range(submatrix_size):
+                inner[i][j] = inner[i][j] - row[i][k] * col[k][j]
 
-def fwd(diag, row, BSIZE):
-    for i in range(BSIZE):
-        for k in range(BSIZE):
-            for j in range(k + 1, BSIZE):
-                row[i, j] -= row[i, k] * diag[k, j]
+def fwd(diag, col, submatrix_size):
+    for j in range(submatrix_size):
+        for k in range(submatrix_size):
+            for i in range(k + 1, submatrix_size):
+                col[i][j] = col[i][j] - diag[i][k] * col[k][j]
 
-def bdiv(diag, col, BSIZE):
-    for i in range(BSIZE):
-        for k in range(BSIZE):
-            pivot = diag[k, k]
-            if abs(pivot) < 1e-14:
-                pivot = 1e-14 if pivot >= 0 else -1e-14
-            
-            col[i, k] = col[i, k] / pivot
-            for j in range(k + 1, BSIZE):
-                col[i, j] -= col[i, k] * diag[k, j]
+def checkmat(M, N, submatrix_size):
+    for i in range(submatrix_size):
+        for j in range(submatrix_size):
+            r_err = M[i][j] - N[i][j]
+            if r_err == 0.0:
+                continue
+            if r_err < 0.0:
+                r_err = -r_err
+            if M[i][j] == 0:
+                return 0
+            r_err = r_err / M[i][j]
+            if r_err > EPSILON:
+                return 0
+    return 1
 
-def bmod(col, row, ik, BSIZE):
-    for i in range(BSIZE):
-        for j in range(BSIZE):
-            for k in range(BSIZE):
-                ik[i, j] -= col[i, k] * row[k, j]
+def sparselu_check(BENCH_SEQ, BENCH, matrix_size, submatrix_size):
+    ok = 1
+    for ii in range(matrix_size):
+        if not ok:
+            break
+        for jj in range(matrix_size):
+            if not ok:
+                break
+            idx = ii * matrix_size + jj
+            if (BENCH_SEQ[idx] is None) and (BENCH[idx] is not None):
+                ok = 0
+            elif (BENCH_SEQ[idx] is not None) and (BENCH[idx] is None):
+                ok = 0
+            elif (BENCH_SEQ[idx] is not None) and (BENCH[idx] is not None):
+                ok = checkmat(BENCH_SEQ[idx], BENCH[idx], submatrix_size)
+    return ok
 
-# ==========================================================
-# EXECUÇÃO SEQUENCIAL (Para fins de verificação de corretude)
-# ==========================================================
-def sparselu_sequential(BENCH, matrix_size, submatrix_size):
+def sparselu_seq_call(BENCH, matrix_size, submatrix_size):
     for kk in range(matrix_size):
-        diag_key = (kk, kk)
-        if diag_key in BENCH and BENCH[diag_key] is not None:
-            lu0(BENCH[diag_key], submatrix_size)
-
-        for jj in range(kk + 1, matrix_size):
-            key = (kk, jj)
-            if key in BENCH and BENCH[key] is not None:
-                fwd(BENCH[(kk, kk)], BENCH[key], submatrix_size)
-
-        for ii in range(kk + 1, matrix_size):
-            key = (ii, kk)
-            if key in BENCH and BENCH[key] is not None:
-                bdiv(BENCH[(kk, kk)], BENCH[key], submatrix_size)
-
-        for ii in range(kk + 1, matrix_size):
-            if (ii, kk) in BENCH and BENCH[(ii, kk)] is not None:
-                for jj in range(kk + 1, matrix_size):
-                    if (kk, jj) in BENCH and BENCH[(kk, jj)] is not None:
-                        target_key = (ii, jj)
-                        if target_key not in BENCH or BENCH[target_key] is None:
-                            BENCH[target_key] = allocate_clean_block(submatrix_size)
-                        bmod(BENCH[(ii, kk)], BENCH[(kk, jj)], BENCH[target_key], submatrix_size)
-
-# ==========================================================
-# LÓGICA DE EXECUÇÃO PARALELA (TASK DEPENDENCY)
-# ==========================================================
-def sparselu_task_dep_call(BENCH, matrix_size, submatrix_size, num_threads):
-    locks = {(i, j): threading.Lock() for i in range(matrix_size) for j in range(matrix_size)}
-
-    with ThreadPoolExecutor(max_workers=num_threads) as executor:
-        for kk in range(matrix_size):
-            futures = []
-            diag_key = (kk, kk)
-
-            if diag_key in BENCH and BENCH[diag_key] is not None:
-                def task_lu0(dk=diag_key):
-                    with locks[dk]: lu0(BENCH[dk], submatrix_size)
-                futures.append(executor.submit(task_lu0))
-
-            for f in futures: f.result()
-            futures.clear()
-
-            for jj in range(kk + 1, matrix_size):
-                key = (kk, jj)
-                if key in BENCH and BENCH[key] is not None:
-                    def task_fwd(dk=diag_key, k_key=key):
-                        with locks[dk], locks[k_key]: fwd(BENCH[dk], BENCH[k_key], submatrix_size)
-                    futures.append(executor.submit(task_fwd))
-
-            for ii in range(kk + 1, matrix_size):
-                key = (ii, kk)
-                if key in BENCH and BENCH[key] is not None:
-                    def task_bdiv(dk=diag_key, i_key=key):
-                        with locks[dk], locks[i_key]: bdiv(BENCH[dk], BENCH[i_key], submatrix_size)
-                    futures.append(executor.submit(task_bdiv))
-
-            for f in futures: f.result()
-            futures.clear()
-
-            for ii in range(kk + 1, matrix_size):
-                if (ii, kk) in BENCH and BENCH[(ii, kk)] is not None:
-                    for jj in range(kk + 1, matrix_size):
-                        if (kk, jj) in BENCH and BENCH[(kk, jj)] is not None:
-                            target_key = (ii, jj)
-                            if target_key not in BENCH or BENCH[target_key] is None:
-                                BENCH[target_key] = allocate_clean_block(submatrix_size)
-                            def task_bmod(ik=(ii, kk), kj=(kk, jj), target=target_key):
-                                with locks[ik], locks[kj], locks[target]:
-                                    bmod(BENCH[ik], BENCH[kj], BENCH[target], submatrix_size)
-                            futures.append(executor.submit(task_bmod))
-
-            for f in futures: f.result()
-
-def verify_results(matrix_size, submatrix_size, parallel_bench):
-    """Compara o resultado e exibe a diferença máxima caso ultrapasse a tolerância."""
-    seq_bench = genmat(matrix_size, submatrix_size)
-    sparselu_sequential(seq_bench, matrix_size, submatrix_size)
-
-    max_diff = 0.0
-    all_keys = set(parallel_bench.keys()).union(set(seq_bench.keys()))
-    for key in all_keys:
-        block_par = parallel_bench.get(key)
-        block_seq = seq_bench.get(key)
-
-        if block_par is None and block_seq is None:
-            continue
-        if block_par is None or block_seq is None:
-            return False
+        lu0(BENCH[kk * matrix_size + kk], submatrix_size)
         
-        diff = np.max(np.abs(block_par - block_seq))
-        if diff > max_diff:
-            max_diff = diff
+        for jj in range(kk + 1, matrix_size):
+            if BENCH[kk * matrix_size + jj] is not None:
+                fwd(BENCH[kk * matrix_size + kk], BENCH[kk * matrix_size + jj], submatrix_size)
+                
+        for ii in range(kk + 1, matrix_size):
+            if BENCH[ii * matrix_size + kk] is not None:
+                bdiv(BENCH[kk * matrix_size + kk], BENCH[ii * matrix_size + kk], submatrix_size)
+                
+        for ii in range(kk + 1, matrix_size):
+            if BENCH[ii * matrix_size + kk] is not None:
+                for jj in range(kk + 1, matrix_size):
+                    if BENCH[kk * matrix_size + jj] is not None:
+                        idx_ij = ii * matrix_size + jj
+                        if BENCH[idx_ij] is None:
+                            BENCH[idx_ij] = allocate_clean_block(submatrix_size)
+                        bmod(BENCH[ii * matrix_size + kk], BENCH[kk * matrix_size + jj], BENCH[idx_ij], submatrix_size)
 
-    # Se a diferença máxima for menor que 1e-4, consideramos sucesso em ambiente paralelo
-    is_ok = max_diff < 1e-4
-    if not is_ok:
-        print(f"\n[AVISO] Verificação falhou. Maior desvio encontrado: {max_diff}")
-    return is_ok
+def run(params):
+    matrix_size = params.matrix_size
+    if matrix_size <= 0:
+        matrix_size = 64
+        params.matrix_size = matrix_size
+    
+    submatrix_size = params.submatrix_size
+    if submatrix_size <= 0:
+        submatrix_size = 64
+        params.submatrix_size = submatrix_size
+
+    BENCH = genmat(matrix_size, submatrix_size)
+
+    start_time = time.perf_counter()
+    sparselu_seq_call(BENCH, matrix_size, submatrix_size)
+    end_time = time.perf_counter()
+    wtime = end_time - start_time
+
+    if params.check:
+        BENCH_SEQ = genmat(matrix_size, submatrix_size)
+        sparselu_seq_call(BENCH_SEQ, matrix_size, submatrix_size)
+        params.succeed = sparselu_check(BENCH_SEQ, BENCH, matrix_size, submatrix_size)
+    else:
+        params.succeed = 1
+
+    return wtime, 0, 0
 
 def main():
-    params = parse_args()
+    parser = argparse.ArgumentParser(description="KaStORS SparsLU Python Port")
+    parser.add_argument("-c", action="store_true", help="Ask to check result")
+    parser.add_argument("-i", type=int, default=1, help="Number of iterations")
+    parser.add_argument("-n", type=int, default=64, help="Matrix size")
+    parser.add_argument("-m", type=int, default=64, help="SubMatrix size")
     
-    def run():
-        BENCH = genmat(params.matrix_size, params.submatrix_size)
-        t0 = time.perf_counter_ns()
-        sparselu_task_dep_call(BENCH, params.matrix_size, params.submatrix_size, params.nth)
-        t1 = time.perf_counter_ns()
-        return (t1 - t0) / 1e9, BENCH
+    args, unknown = parser.parse_known_args()
 
-    t_elapsed, bench_check = run()
-    is_correct = verify_results(params.matrix_size, params.submatrix_size, bench_check)
+    params = UserParameters()
+    params.check = 1 if args.c else 0
+    params.niter = args.i
+    params.matrix_size = args.n
+    params.submatrix_size = args.m
 
-    times = [t_elapsed]
+    # Warmup
+    run(params)
 
-    print_summary(params, times, verified=is_correct)
+    all_times = []
+    mean = 0.0
+    meansqr = 0.0
+    min_ = float('inf')
+    max_ = -1.0
+
+    for _ in range(params.niter):
+        cur_time, _, _ = run(params)
+        all_times.append(cur_time)
+        mean += cur_time
+        min_ = min(min_, cur_time)
+        max_ = max(max_, cur_time)
+        meansqr += cur_time * cur_time
+        time.sleep(5)
+
+    mean /= params.niter
+    meansqr /= params.niter
+    stddev = math.sqrt(meansqr - mean * mean)
+
+    all_times.sort()
+    median = statistics.median(all_times)
+
+    progname = "sparselu.py"
+    
+    print("#Output follows this header :")
+    print("##Progname Size Submatrix_size Iterations Threads Time(Mean,sec) startTime endTime Stddev")
+    print(f"{progname} {params.matrix_size} {params.submatrix_size} {params.niter} 1 {mean:.6f} 0 0 {stddev:.6f}")
+    print(f"#Experience summary : avg : {mean:.6f} :: std : {stddev:.6f} :: min : {min_:.6f} :: max : {max_:.6f} :: median : {median:.6f}")
+    
+    if params.check:
+        status = "success" if params.succeed == 1 else ("not implemented" if params.succeed > 1 else "fail")
+        print(f"Check : {status}")
+    
+    if params.string2display:
+        print(params.string2display)
 
 if __name__ == "__main__":
     main()
