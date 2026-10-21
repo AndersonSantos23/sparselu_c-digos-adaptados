@@ -19,7 +19,7 @@ def allocate_clean_block(submatrix_size):
     return [[0.0 for _ in range(submatrix_size)] for _ in range(submatrix_size)]
 
 def genmat(matrix_size, submatrix_size):
-    M = [[None for _ in range(matrix_size)] for _ in range(matrix_size)]
+    M = [None] * (matrix_size * matrix_size)
     init_val = 1325
 
     for ii in range(matrix_size):
