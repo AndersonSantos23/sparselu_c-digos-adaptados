@@ -1,14 +1,12 @@
-#!/usr/bin/env bash
-
 # ==============================================================================
 # USO:
 #   ./run_experiment.sh <caminho_do_arquivo> [argumentos_do_calculo...]
 #
 # EXEMPLOS DE USO:
-#   1. C Paralelo:     ./run_experiment.sh ./sparselu_par 10 64
-#   2. C Sequencial:   ./run_experiment.sh ./sparselu_seq 10 64
+#   1. C Paralelo:      ./run_experiment.sh ./sparselu_par -n 10 -m 64
+#   2. C Sequencial:    ./run_experiment.sh ./sparselu_seq -n 10 -m 64
 #   3. Python Paralelo: ./run_experiment.sh ./sparselu_par.py 10 64
-#   4. Python Seq:     ./run_experiment.sh ./sparselu_seq.py 10 64
+#   4. Python Seq:      ./run_experiment.sh ./sparselu_seq.py 10 64
 # ==============================================================================
 
 if [ -z "$1" ]; then
@@ -20,7 +18,8 @@ fi
 # Captura o primeiro argumento como o executável/script e o restante como parâmetros
 BENCH="$1"
 shift
-CLASSES=("$*")  # Exemplo: "10 64"
+# Mantém os argumentos como uma string (ex: "-n 10 -m 64" ou múltiplos conjuntos se necessário)
+CLASSES=("$*")
 
 date=`date +%d_%m_%Y_%Hh_%Mmin_%Ss`
 HNAMES=`hostname`
@@ -37,7 +36,7 @@ sudo /usr/local/bin/off_turbo.sh
 sudo /usr/local/bin/off_ht.sh
 sudo /usr/local/bin/gov_performance.sh
 
-source ~/spack/share/spack/setup-env.sh 2>/dev/null || true # ajustar se necessário
+source ~/spack/share/spack/setup-env.sh 2>/dev/null || true
 
 origin="$PWD"
 pushd "$expdir" > /dev/null
@@ -54,12 +53,11 @@ fi
 
 # Identifica se é versão sequencial
 is_seq=0
-if [[ "$benchname" == *seq* ]] \vert{}\vert{} [[ "$benchname" == *sec* ]]; then
+if [[ "$benchname" == *seq* ]] || [[ "$benchname" == *sec* ]]; then
     is_seq=1
 fi
 
 for r in `seq 3`; do  # 3 repetições
-    # Se for sequencial, roda apenas com 1 thread. Se for paralelo, itera na lista.
     if [ $is_seq -eq 1 ]; then
         CURRENT_THREADS=(1)
     else
@@ -68,14 +66,16 @@ for r in `seq 3`; do  # 3 repetições
 
     for threads in "${CURRENT_THREADS[@]}"; do
         for class in "${CLASSES[@]}"; do
+            # Substitui espaços e hífens por underscore para gerar um nome de arquivo de log limpo
             classname=${class// /_}
+            classname=${classname//\//_}
             output="tcc:${threads}-turbo:off-ht:off-${benchname}:${classname}-Rep:${r}"
-            
+
             echo "--------------------------------------------------------"
             echo "Running $output"
 
             if [ -f "$output.appout" ]; then
-                if [ ! -s "$output.appout" ]; then  # Arquivo existe mas tá vazio
+                if [ ! -s "$output.appout" ]; then
                     rm -f "$output.appout"
                 else
                     echo "Skip this case ($output.appout já existe)"
@@ -86,18 +86,16 @@ for r in `seq 3`; do  # 3 repetições
             # Monta o comando de execução dependendo do tipo (Python x C e Paralelo x Seq)
             if [ $is_python -eq 1 ]; then
                 if [ $is_seq -eq 1 ]; then
-                    # Python Sequencial: python3 script.py NB BSIZE
                     python3 "$origin/$BENCH" $class > "$output.appout" 2>&1
                 else
-                    # Python Paralelo: python3 script.py NB BSIZE THREADS
                     python3 "$origin/$BENCH" $class $threads > "$output.appout" 2>&1
                 fi
             else
                 if [ $is_seq -eq 1 ]; then
-                    # C Sequencial: ./sparselu_seq NB BSIZE
+                    # C Sequencial com argumentos nomeados (ex: -n 10 -m 64)
                     "$origin/$BENCH" $class > "$output.appout" 2>&1
                 else
-                    # C Paralelo (OpenMP): OMP_NUM_THREADS=X ./sparselu_par NB BSIZE
+                    # C Paralelo (OpenMP) com argumentos nomeados
                     OMP_NUM_THREADS=$threads "$origin/$BENCH" $class > "$output.appout" 2>&1
                 fi
             fi

@@ -43,13 +43,12 @@ def bdiv(diag, row, submatrix_size):
 
 
 def bmod(row, col, inner, submatrix_size):
-    """Modificação de bloco."""
+    """Modificação de bloco (subtrai a cada k, como no C)."""
     for i in range(submatrix_size):
         for j in range(submatrix_size):
-            sum_val = 0.0
             for k in range(submatrix_size):
-                sum_val += row[i * submatrix_size + k] * col[k * submatrix_size + j]
-            inner[i * submatrix_size + j] -= sum_val
+                inner[i * submatrix_size + j] = inner[i * submatrix_size + j] - row[i * submatrix_size + k] * col[k * submatrix_size + j]
+
 
 
 def fwd(diag, col, submatrix_size):
